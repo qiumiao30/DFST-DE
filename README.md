@@ -5,7 +5,7 @@ Efficient wind power cluster management and sustainable industry development req
 
 # Model Overview
 
-![model](https://github.com/qiumiao30/SLMR/blob/master/image/model.png)
+![model]([https://github.com/qiumiao30/SLMR/blob/master/image/model.png](https://github.com/qiumiao30/DFST-DE/blob/master/newhasa.pdf))
 
 # Geting Started
 To clone this repo:
