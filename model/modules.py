@@ -1,6 +1,135 @@
 import torch
 import torch.nn as nn
 
+class GraphAttentionLayer(nn.Module):
+    """
+    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
+    图注意力层
+    """
+
+    def __init__(self, in_features, in_feat, out_features, dropout, alpha, concat=True):
+        super(GraphAttentionLayer, self).__init__()
+        self.in_features = in_feat  # 节点表示向量的输入特征维度
+        self.out_features = out_features  # 节点表示向量的输出特征维度
+        self.time_step = in_feat
+        self.in_feat = in_feat
+        # self.dropout = dropout  # dropout参数
+        self.alpha = alpha  # leakyrelu激活的参数
+        self.concat = concat  # 如果为true, 再进行elu激活
+
+        # 定义可训练参数，即论文中的W和a
+        self.W = nn.Parameter(torch.zeros(size=(self.in_feat, self.out_features)))
+        nn.init.xavier_uniform_(self.W.data, gain=1.414)  # xavier初始化
+        self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)  # xavier初始化
+        self.weight_key = nn.Parameter(torch.zeros(size=(self.in_feat, 1)))  # nn.Parameter:参数初始化
+        self.weight_query = nn.Parameter(torch.zeros(size=(self.in_feat, 1)))
+
+        embed_dim = 128
+        self.embedding = nn.Embedding(in_features, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # 定义leakyrelu激活函数
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+        # self.GRU = nn.GRU(self.time_step, self.in_features, batch_first=True)  ##GRU input: (time_step, hidden(features))
+
+    # def self_graph_attention(self, input):
+    #     input = input.contiguous()
+    #     bat, N, fea = input.size()
+    #     key = torch.matmul(input, self.weight_key)
+    #     query = torch.matmul(input, self.weight_query)
+    #     data = key.repeat(1, 1, N).view(bat, N * N, 1) + query.repeat(1, N, 1) # repeat()重复
+    #     data = data.squeeze(2) # 减少第二个维度，如果第二个维度为1的话
+    #     data = data.view(bat, N, -1)
+    #     data = self.leakyrelu(data)
+    #     attention = F.softmax(data, dim=2)
+    #     attention = self.dropout(attention)
+    #     return attention
+
+    def forward(self, x):
+        """
+        inp: input_fea [N, in_features]  in_features表示节点的输入特征向量元素个数
+        adj: 图的邻接矩阵 维度[N, N] 非零即一，数据结构基本知识
+        """
+        # input, _ = self.GRU(x.permute(2, 0, 1).contiguous())  ##contiguous(),改变数据存储地址
+        # input = input.permute(1, 0, 2).contiguous()  ##permute()不会改变存储位置
+        # attention = self.self_graph_attention(input)
+        # attention = torch.mean(attention, dim=0)
+        # # degree = torch.sum(attention, dim=1)
+        # # laplacian is sym or not
+        # adj = 0.5 * (attention + attention.T)
+
+        all_embeddings = self.embedding(torch.arange(38))
+        weights_arr = all_embeddings.detach().clone()
+        weights = weights_arr.view(38, -1)
+
+        cos_ji_mat = torch.matmul(weights, weights.T)
+        normed_mat = torch.matmul(weights.norm(dim=-1).view(-1, 1), weights.norm(dim=-1).view(1, -1))
+        adj = cos_ji_mat / normed_mat
+
+        top_k = 10
+        filter_value = float(1)
+        indices_to_remove = adj > torch.topk(adj, top_k)[0][..., -2, None]
+        # print(indices_to_remove)
+        adj[indices_to_remove] = filter_value  # 对于topk之外的其他元素的logits值设为负无穷
+
+        x = x.permute(0, 2, 1)
+        h = torch.matmul(x, self.W)  # [N, out_features]
+        N = h.size()[1]  # N 图的节点数
+
+        left = h.repeat_interleave(N, dim=1)
+        right = h.repeat(1, N, 1)
+        a_input = torch.cat((left, right), dim=2).reshape(h.shape[0], N, N, -1)
+
+        # a_input = torch.cat([h.repeat(1, N).view(N * N, -1), h.repeat(N, 1)], dim=1).view(N, -1, 2 * self.out_features)
+        # [N, N, 2*out_features]
+        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3))
+        # [N, N, 1] => [N, N] 图注意力的相关系数（未归一化）
+
+        zero_vec = -1e12 * torch.ones_like(e)  # 将没有连接的边置为负无穷
+        attention = torch.where(adj == 1, e, zero_vec)  # [N, N]
+        print(attention)
+        # 表示如果邻接矩阵元素大于0时，则两个节点有连接，该位置的注意力系数保留，
+        # 否则需要mask并置为非常小的值，原因是softmax的时候这个最小值会不考虑。
+        # attention = F.softmax(e, dim=1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
+        attention = F.softmax(attention, dim=1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
+        print("iiiii", attention)
+        attention = F.dropout(attention, 0.2, training=self.training)  # dropout，防止过拟合
+        h_prime = torch.matmul(attention, h)  # [N, N].[N, out_features] => [N, out_features]
+        # 得到由周围节点通过注意力权重进行更新的表示
+        if self.concat:
+            return F.elu(h_prime).permute(0,2,1)
+        else:
+            return h_prime.permute(0,2,1)
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
+
+class GAT(nn.Module):
+    def __init__(self, n_features, in_feat, n_hid, n_class, dropout, alpha, n_heads):
+        """Dense version of GAT
+        n_heads 表示有几个GAL层，最后进行拼接在一起，类似self-attention
+        从不同的子空间进行抽取特征。
+        """
+        super(GAT, self).__init__()
+        self.dropout = dropout
+
+        # 定义multi-head的图注意力层
+        self.attentions = [GraphAttentionLayer(n_features, in_feat, n_hid, dropout=dropout, alpha=alpha, concat=True) for _ in
+                           range(n_heads)]
+        for i, attention in enumerate(self.attentions):
+            self.add_module('attention_{}'.format(i), attention)  # 加入pytorch的Module模块
+        # 输出层，也通过图注意力层来实现，可实现分类、预测等功能
+        self.out_att = GraphAttentionLayer(n_features, n_hid * n_heads, n_class, dropout=dropout, alpha=alpha, concat=False)
+
+    def forward(self, x):
+        x = F.dropout(x, self.dropout, training=self.training)  # dropout，防止过拟合
+        x = torch.cat([att(x) for att in self.attentions], dim=1)  # 将每个head得到的表示进行拼接
+        x = F.dropout(x, self.dropout, training=self.training)  # dropout，防止过拟合
+        x = F.elu(self.out_att(x))  # 输出并激活
+        return F.log_softmax(x, dim=1)  # log_softmax速度变快，保持数值稳定
 
 class ConvLayer(nn.Module):
     """1-D Convolution layer to extract high-level features of each time-series input
@@ -23,6 +152,176 @@ class ConvLayer(nn.Module):
         x = self.relu(self.conv(x)) # output:(N, Cout, Lout)-->(batch, channel, seq_len)
         return x.permute(0, 2, 1)  # Permute back
 
+# class GraphAttentionLayer(nn.Module):
+#     """
+#     Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
+#     图注意力层
+#     """
+#
+#     def __init__(self, in_features, out_features, dropout, alpha, concat=True):
+#         super(GraphAttentionLayer, self).__init__()
+#         self.in_features = in_features  # 节点表示向量的输入特征维度
+#         self.out_features = out_features  # 节点表示向量的输出特征维度
+#         self.time_step = in_features
+#         # self.dropout = dropout  # dropout参数
+#         self.alpha = alpha  # leakyrelu激活的参数
+#         self.concat = concat  # 如果为true, 再进行elu激活
+#
+#         # 定义可训练参数，即论文中的W和a
+#         self.W = nn.Parameter(torch.zeros(size=(self.in_features, self.out_features)))
+#         nn.init.xavier_uniform_(self.W.data, gain=1.414)  # xavier初始化
+#         self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
+#         nn.init.xavier_uniform_(self.a.data, gain=1.414)  # xavier初始化
+#         self.weight_key = nn.Parameter(torch.zeros(size=(self.in_features, 1)))  # nn.Parameter:参数初始化
+#         self.weight_query = nn.Parameter(torch.zeros(size=(self.in_features, 1)))
+#
+#         self.dropout = nn.Dropout(dropout)
+#
+#         # 定义leakyrelu激活函数
+#         self.leakyrelu = nn.LeakyReLU(self.alpha)
+#
+#         self.GRU = nn.GRU(self.time_step, self.in_features, batch_first=True)  ##GRU input: (time_step, hidden(features))
+#
+#     def self_graph_attention(self, input):
+#         input = input.contiguous()
+#         bat, N, fea = input.size()
+#         key = torch.matmul(input, self.weight_key)
+#         query = torch.matmul(input, self.weight_query)
+#         data = key.repeat(1, 1, N).view(bat, N * N, 1) + query.repeat(1, N, 1) # repeat()重复
+#         data = data.squeeze(2) # 减少第二个维度，如果第二个维度为1的话
+#         data = data.view(bat, N, -1)
+#         data = self.leakyrelu(data)
+#         attention = F.softmax(data, dim=2)
+#         attention = self.dropout(attention)
+#         return attention
+#
+#     def forward(self, x):
+#         """
+#         inp: input_fea [N, in_features]  in_features表示节点的输入特征向量元素个数
+#         adj: 图的邻接矩阵 维度[N, N] 非零即一，数据结构基本知识
+#         """
+#         input, _ = self.GRU(x.permute(2, 0, 1).contiguous())  ##contiguous(),改变数据存储地址
+#         input = input.permute(1, 0, 2).contiguous()  ##permute()不会改变存储位置
+#         attention = self.self_graph_attention(input)
+#         attention = torch.mean(attention, dim=0)
+#         # degree = torch.sum(attention, dim=1)
+#         # laplacian is sym or not
+#         adj = 0.5 * (attention + attention.T)
+#
+#         topk_num = 10
+#         topk_indices_ji = torch.topk(adj, topk_num, dim=-1)[1]
+#         self.learned_graph = topk_indices_ji
+#
+#         gated_i = torch.arange(0, x.shape[2]).T.unsqueeze(1).repeat(1, topk_num).flatten().unsqueeze(0)
+#         gated_j = topk_indices_ji.flatten().unsqueeze(0)
+#         gated_edge_index = torch.cat((gated_j, gated_i), dim=0)
+#
+#         x = x.permute(0, 2, 1)
+#         h = torch.matmul(x, self.W)  # [N, out_features]
+#         N = h.size()[1]  # N 图的节点数
+#
+#         left = h.repeat_interleave(N, dim=1)
+#         right = h.repeat(1, N, 1)
+#         a_input = torch.cat((left, right), dim=2).reshape(h.shape[0], N, N, -1)
+#
+#         # a_input = torch.cat([h.repeat(1, N).view(N * N, -1), h.repeat(N, 1)], dim=1).view(N, -1, 2 * self.out_features)
+#         # [N, N, 2*out_features]
+#         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3))
+#         # [N, N, 1] => [N, N] 图注意力的相关系数（未归一化）
+#
+#         zero_vec = -1e12 * torch.ones_like(e)  # 将没有连接的边置为负无穷
+#         attention = torch.where(adj > e.mean(), e, zero_vec)  # [N, N]
+#         # 表示如果邻接矩阵元素大于0时，则两个节点有连接，该位置的注意力系数保留，
+#         # 否则需要mask并置为非常小的值，原因是softmax的时候这个最小值会不考虑。
+#         attention = F.softmax(attention, dim=1)  # softmax形状保持不变 [N, N]，得到归一化的注意力权重！
+#         attention = F.dropout(attention, 0.2, training=self.training)  # dropout，防止过拟合
+#         h_prime = torch.matmul(attention, h)  # [N, N].[N, out_features] => [N, out_features]
+#         # 得到由周围节点通过注意力权重进行更新的表示
+#         if self.concat:
+#             return F.elu(h_prime).permute(0,2,1)
+#         else:
+#             return h_prime.permute(0,2,1)
+#
+#     def __repr__(self):
+#         return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
+#
+# class GAT(nn.Module):
+#     def __init__(self, n_feat, n_hid, n_class, dropout, alpha, n_heads):
+#         """Dense version of GAT
+#         n_heads 表示有几个GAL层，最后进行拼接在一起，类似self-attention
+#         从不同的子空间进行抽取特征。
+#         """
+#         super(GAT, self).__init__()
+#         self.dropout = dropout
+#
+#         # 定义multi-head的图注意力层
+#         self.attentions = [GraphAttentionLayer(n_feat, n_hid, dropout=dropout, alpha=alpha, concat=True) for _ in
+#                            range(n_heads)]
+#         for i, attention in enumerate(self.attentions):
+#             self.add_module('attention_{}'.format(i), attention)  # 加入pytorch的Module模块
+#         # 输出层，也通过图注意力层来实现，可实现分类、预测等功能
+#         self.out_att = GraphAttentionLayer(n_hid * n_heads, n_class, dropout=dropout, alpha=alpha, concat=False)
+#
+#     def forward(self, x):
+#         x = F.dropout(x, self.dropout, training=self.training)  # dropout，防止过拟合
+#         x = torch.cat([att(x) for att in self.attentions], dim=1)  # 将每个head得到的表示进行拼接
+#         x = F.dropout(x, self.dropout, training=self.training)  # dropout，防止过拟合
+#         x = F.elu(self.out_att(x))  # 输出并激活
+#         return F.log_softmax(x, dim=1)  # log_softmax速度变快，保持数值稳定
+
+Tensor = torch.Tensor
+def gumbel_softmax(logits: Tensor, tau: float = 1, hard: bool = False, eps: float = 1e-10, dim: int = -1) -> Tensor:
+    r"""
+    Samples from the Gumbel-Softmax distribution (`Link 1`_  `Link 2`_) and optionally discretizes.
+    Args:
+      logits: `[..., num_features]` unnormalized log probabilities
+      tau: non-negative scalar temperature
+      hard: if ``True``, the returned samples will be discretized as one-hot vectors,
+            but will be differentiated as if it is the soft sample in autograd
+      dim (int): A dimension along which softmax will be computed. Default: -1.
+    Returns:
+      Sampled tensor of same shape as `logits` from the Gumbel-Softmax distribution.
+      If ``hard=True``, the returned samples will be one-hot, otherwise they will
+      be probability distributions that sum to 1 across `dim`.
+    .. note::
+      This function is here for legacy reasons, may be removed from nn.Functional in the future.
+    .. note::
+      The main trick for `hard` is to do  `y_hard - y_soft.detach() + y_soft`
+      It achieves two things:
+      - makes the output value exactly one-hot
+      (since we add then subtract y_soft value)
+      - makes the gradient equal to y_soft gradient
+      (since we strip all other gradients)
+    Examples::
+        >>> logits = torch.randn(20, 32)
+        >>> # Sample soft categorical using reparametrization trick:
+        >>> F.gumbel_softmax(logits, tau=1, hard=False)
+        >>> # Sample hard categorical using "Straight-through" trick:
+        >>> F.gumbel_softmax(logits, tau=1, hard=True)
+    .. _Link 1:
+        https://arxiv.org/abs/1611.00712
+    .. _Link 2:
+        https://arxiv.org/abs/1611.01144
+    """
+    if eps != 1e-10:
+        warnings.warn("`eps` parameter is deprecated and has no effect.")
+
+    gumbels = (
+        -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
+    )  # ~Gumbel(0,1)
+    gumbels = (logits + gumbels) / tau  # ~Gumbel(logits,tau)
+    # y_soft = gumbels.softmax(dim)
+    y_soft = gumbels
+
+    if hard:
+        # Straight through.
+        index = y_soft.max(dim, keepdim=True)[1]
+        y_hard = torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
+        ret = y_hard - y_soft.detach() + y_soft
+    else:
+        # Reparametrization trick.
+        ret = y_soft
+    return ret
 
 class FeatureAttentionLayer(nn.Module):
     """Single Graph Feature/Spatial Attention Layer
@@ -35,7 +334,7 @@ class FeatureAttentionLayer(nn.Module):
     :param use_bias: whether to include a bias term in the attention layer
     """
 
-    def __init__(self, n_features, window_size, dropout, alpha, embed_dim=None, use_gatv2=True, use_bias=True):
+    def __init__(self, n_features, window_size, dropout, embed_dim, alpha, use_gatv2=True, use_bias=True):
         super(FeatureAttentionLayer, self).__init__()
         self.n_features = n_features
         self.window_size = window_size
@@ -55,11 +354,14 @@ class FeatureAttentionLayer(nn.Module):
             a_input_dim = 2 * self.embed_dim
 
         self.lin = nn.Linear(lin_input_dim, self.embed_dim)
-        self.a = nn.Parameter(torch.empty((a_input_dim, 1)))
+        self.a = nn.Parameter(torch.zeros((a_input_dim, 1)))
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
+        embed_dim = self.embed_dim
+        self.embedding = nn.Embedding(n_features, embed_dim)
+
         if self.use_bias:
-            self.bias = nn.Parameter(torch.empty(n_features, n_features))
+            self.bias = nn.Parameter(torch.zeros(n_features, n_features))
 
         self.leakyrelu = nn.LeakyReLU(alpha)
         self.sigmoid = nn.Sigmoid()
@@ -70,6 +372,32 @@ class FeatureAttentionLayer(nn.Module):
 
         x = x.permute(0, 2, 1)
 
+        #==================================================
+
+        all_embeddings = self.embedding(torch.arange(self.n_features))
+
+        weights_arr = all_embeddings.detach().clone()
+        weights = weights_arr.view(self.n_features, -1)
+
+        cos_ji_mat = torch.matmul(weights, weights.T)
+        normed_mat = torch.matmul(weights.norm(dim=-1).view(-1, 1), weights.norm(dim=-1).view(1, -1))
+        learned_graph = cos_ji_mat / normed_mat
+
+        norm = torch.norm(all_embeddings, p=2, dim=1, keepdim=True)
+        norm = torch.mm(norm, norm.transpose(0, 1))
+
+        learned_graph = learned_graph / norm
+        learned_graph = (learned_graph + 1) / 2.
+
+        learned_graph = torch.stack([learned_graph, 1 - learned_graph], dim=-1)
+        adj = gumbel_softmax(learned_graph, tau=1, hard=True)
+
+        adj = adj[:, :, 0].clone().reshape(self.n_features, -1)
+        # mask = torch.eye(self.num_nodes, self.num_nodes).to(device).byte()
+        mask = torch.eye(self.n_features, self.n_features).bool()
+        adj = adj.masked_fill_(mask, 0)
+        #==================================================
+
         # 'Dynamic' GAT attention
         # Proposed by Brody et. al., 2021 (https://arxiv.org/pdf/2105.14491.pdf)
         # Linear transformation applied after concatenation and attention layer applied after leakyrelu
@@ -77,6 +405,11 @@ class FeatureAttentionLayer(nn.Module):
             a_input = self._make_attention_input(x)                 # (b, k, k, 2*window_size)
             a_input = self.leakyrelu(self.lin(a_input))             # (b, k, k, embed_dim)
             e = torch.matmul(a_input, self.a).squeeze(3)            # (b, k, k, 1)
+
+            #############################################
+            zero_vec = -1e12 * torch.ones_like(e)
+            e = torch.where(adj == 1, e, zero_vec)  # [N, N]
+            #############################################
 
         # Original GAT attention
         else:
